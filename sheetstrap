@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+#
+# sheetstrap — the SheetOS bootstrapper. "Talos for spreadsheets".
+#
+# SheetOS is a minimal, API-only, declarative node OS whose single job is to
+# bootstrap and run Sheeternetes. There is no shell to log into and no config to
+# hand-edit on the node: you declare a machineconfig, and sheetstrap applies it.
+# Everything is declared; nothing is mutated in place.
+#
+# Requires: bash, jq.
+#
+# Config model (Talos-style machineconfig, one JSON file per node):
+#   machineconfig.<node>.json  — node name, role, apiserver URL, token, docker.
+#
+# Usage:
+#   sheetstrap gen-config --name <node> [--controlplane|--worker] \
+#                         [--webapp URL] [--token TOK]
+#   sheetstrap bootstrap  machineconfig.<node>.json
+#   sheetstrap join       <webapp_url> <token> --name <node>
+#   sheetstrap validate   machineconfig.<node>.json
+#   sheetstrap version
+#
+set -euo pipefail
+
+SHEETSTRAP_VERSION="0.1.0"
+APIVERSION="sheetos/v1alpha1"
+
+# ---- prerequisites ---------------------------------------------------------
+command -v jq >/dev/null 2>&1 || { echo "sheetstrap: jq is required (brew install jq / apt install jq)" >&2; exit 1; }
+
+die()  { echo "sheetstrap: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+# ---- config path helper ----------------------------------------------------
+cfg_path() { echo "machineconfig.$1.json"; }
+
+# ---- gen-config ------------------------------------------------------------
+# Render a declarative machineconfig. Immutable artifact: regenerate, don't edit.
+cmd_gen_config() {
+  local name="" role="controlplane" webapp="https://script.google.com/macros/s/REPLACE_ME/exec" token="CHANGE_ME_super_secret"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)          name="${2:?--name needs a value}"; shift 2 ;;
+      --controlplane)  role="controlplane"; shift ;;
+      --worker)        role="worker"; shift ;;
+      --webapp)        webapp="${2:?--webapp needs a value}"; shift 2 ;;
+      --token)         token="${2:?--token needs a value}"; shift 2 ;;
+      *) die "gen-config: unknown flag '$1'" ;;
+    esac
+  done
+  [ -n "$name" ] || die "gen-config: --name <node> is required"
+
+  local out; out="$(cfg_path "$name")"
+  jq -n \
+    --arg apiVersion "$APIVERSION" \
+    --arg kind "MachineConfig" \
+    --arg name "$name" \
+    --arg role "$role" \
+    --arg webapp "$webapp" \
+    --arg token "$token" \
+    --arg net "sheeternetes" \
+    '{
+      apiVersion: $apiVersion,
+      kind: $kind,
+      machine: {
+        name: $name,
+        role: $role,
+        immutable: true,
+        install: { disk: "none", wipe: false }
+      },
+      cluster: {
+        controlPlane: { apiserverURL: $webapp },
+        token: $token
+      },
+      docker: {
+        network: $net,
+        namePrefix: "sk_",
+        cpuTotalMillicores: 2000,
+        memTotalMiB: 2048,
+        heartbeatSeconds: 10
+      }
+    }' > "$out"
+
+  info "==> wrote declarative machineconfig: $out"
+  info "    role=$role  apiserver=$webapp"
+  info "    This artifact is immutable — regenerate it, do not hand-edit."
+  info "    Next: sheetstrap bootstrap $out   (control plane)"
+  info "          sheetstrap validate  $out"
+  echo "$out"
+}
+
+# ---- validate --------------------------------------------------------------
+cmd_validate() {
+  local file="${1:?usage: sheetstrap validate machineconfig.<node>.json}"
+  [ -f "$file" ] || die "validate: no such file: $file"
+  jq empty "$file" 2>/dev/null || die "validate: $file is not valid JSON"
+
+  local errors=0
+  check() {
+    local path="$1" label="$2"
+    local v; v="$(jq -r "$path // empty" "$file")"
+    if [ -z "$v" ]; then
+      echo "  MISSING  $label" >&2
+      errors=$((errors + 1))
+    else
+      echo "  ok       $label = $v" >&2
+    fi
+  }
+
+  info "==> validating $file against $APIVERSION"
+  check '.apiVersion'                 'apiVersion'
+  check '.kind'                       'kind'
+  check '.machine.name'              'machine.name'
+  check '.machine.role'              'machine.role'
+  check '.cluster.controlPlane.apiserverURL' 'cluster.controlPlane.apiserverURL'
+  check '.cluster.token'             'cluster.token'
+  check '.docker.network'            'docker.network'
+
+  local role; role="$(jq -r '.machine.role // empty' "$file")"
+  case "$role" in
+    controlplane|worker) ;;
+    "") ;; # already reported missing
+    *) echo "  INVALID  machine.role must be controlplane|worker (got '$role')" >&2; errors=$((errors + 1)) ;;
+  esac
+
+  local token; token="$(jq -r '.cluster.token // empty' "$file")"
+  if [ "$token" = "CHANGE_ME_super_secret" ]; then
+    echo "  WARN     cluster.token is still the default — set a real --token before production" >&2
+  fi
+
+  if [ "$errors" -ne 0 ]; then
+    die "validate: $file has $errors error(s)"
+  fi
+  info "==> $file is valid."
+}
+
+# ---- bootstrap -------------------------------------------------------------
+# Print the ordered, declarative bootstrap sequence for a control-plane node and
+# emit a ready-to-source .skctl.env. SheetOS is API-only: the sheet is the disk,
+# the Apps Script web app is the apiserver, setup() is the one-time install.
+cmd_bootstrap() {
+  local file="${1:?usage: sheetstrap bootstrap machineconfig.<node>.json}"
+  cmd_validate "$file"
+
+  local name role webapp token net
+  name="$(jq -r '.machine.name' "$file")"
+  role="$(jq -r '.machine.role' "$file")"
+  webapp="$(jq -r '.cluster.controlPlane.apiserverURL' "$file")"
+  token="$(jq -r '.cluster.token' "$file")"
+  net="$(jq -r '.docker.network' "$file")"
+
+  [ "$role" = "controlplane" ] || die "bootstrap: $file has role=$role; only a controlplane node bootstraps a cluster (use 'join' for workers)"
+
+  cat >&2 <<EOF
+
+==> Bootstrapping SheetOS control plane '$name'
+    Model: API-only, immutable, declarative. The Sheet is the disk; the Apps
+    Script web app is the apiserver; the machineconfig is the source of truth.
+
+    Ordered bootstrap sequence:
+      1. Create a blank Google Sheet          — the cluster's persistent disk.
+      2. Deploy the Apps Script apiserver      — paste Code.gs, deploy as a Web
+         App ("execute as me", "anyone with the link"). Copy the /exec URL.
+      3. Run setup()                           — one-time install: lays down the
+         Nodes / Pods / Deployments / Events tables. Idempotent.
+      4. Register the first node ('$name')     — the kubelet heartbeats the
+         apiserver and reconciles local Docker to the declared pods.
+
+    Node applies from this immutable machineconfig ($file) — nothing is
+    hand-edited on the node. Regenerate the config to change anything.
+EOF
+
+  local env_out=".skctl.env"
+  {
+    echo "# generated by sheetstrap bootstrap from $file — do not hand-edit"
+    echo "# source this next to skctl:  . ./.skctl.env"
+    echo "WEBAPP_URL=$webapp"
+    echo "TOKEN=$token"
+  } > "$env_out"
+
+  cat >&2 <<EOF
+
+==> wrote $env_out (WEBAPP_URL/TOKEN) — source it for skctl:
+      . ./$env_out && ./skctl get nodes
+
+==> bring the node online with the same declared identity:
+      WEBAPP_URL=$webapp TOKEN=$token \\
+        NODE_NAME=$name SK_NET=$net ./kubelet.sh
+
+Control plane '$name' is declared. Apply workloads with: skctl apply <spec>.json
+EOF
+}
+
+# ---- join ------------------------------------------------------------------
+# Configure a worker: write its .skctl.env and a worker machineconfig. No manual
+# node config — the worker inherits the declared apiserver URL + token.
+cmd_join() {
+  [ $# -ge 2 ] || die "usage: sheetstrap join <webapp_url> <token> --name <node>"
+  local webapp="$1" token="$2"; shift 2
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="${2:?--name needs a value}"; shift 2 ;;
+      *) die "join: unknown flag '$1'" ;;
+    esac
+  done
+  [ -n "$name" ] || die "join: --name <node> is required"
+
+  # Reuse gen-config to produce the immutable worker machineconfig.
+  local cfg; cfg="$(cmd_gen_config --name "$name" --worker --webapp "$webapp" --token "$token")"
+
+  local env_out=".skctl.env"
+  {
+    echo "# generated by sheetstrap join for worker '$name' — do not hand-edit"
+    echo "WEBAPP_URL=$webapp"
+    echo "TOKEN=$token"
+  } > "$env_out"
+
+  cat >&2 <<EOF
+
+==> Joined worker '$name' to the SheetOS control plane (API-only, immutable).
+    wrote $cfg       — immutable worker machineconfig
+    wrote $env_out   — WEBAPP_URL/TOKEN for skctl
+
+==> start the kubelet with the declared identity:
+      WEBAPP_URL=$webapp TOKEN=$token NODE_NAME=$name ./kubelet.sh
+
+The worker holds no local config of its own — it reconciles from the Sheet.
+EOF
+}
+
+# ---- dispatch --------------------------------------------------------------
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  gen-config) cmd_gen_config "$@" ;;
+  bootstrap)  cmd_bootstrap "$@" ;;
+  join)       cmd_join "$@" ;;
+  validate)   cmd_validate "$@" ;;
+  version|--version|-v) echo "sheetstrap $SHEETSTRAP_VERSION ($APIVERSION)" ;;
+  help|--help|-h|*)
+    grep '^#' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac
