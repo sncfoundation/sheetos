@@ -9,7 +9,7 @@ A <a href="https://sncfoundation.github.io">Sheet-Native Computing Foundation</a
 
 ---
 
-**Status:** 📝 Unsaved Draft &#183; this project is a proposal. Design notes and contributions are welcome.
+**Status:** 📝 Unsaved Draft &#183; no longer just a proposal. A working prototype shipped as [v0.1.0](https://github.com/sncfoundation/sheetos/releases/tag/v0.1.0): `sheetstrap` generates and validates machineconfigs and wires up workers, but `bootstrap` still prints the steps instead of bringing the node up itself. The [tracking issue #26](https://github.com/sncfoundation/sheeternetes/issues/26) stays open until the OS boots on its own.
 
 ## About
 
@@ -87,7 +87,7 @@ WEBAPP_URL=... TOKEN=... NODE_NAME=node-a ./kubelet.sh
 
 ## Get involved
 
-- 📋 Tracking issue &amp; design: [sncfoundation/sheeternetes#26](https://github.com/sncfoundation/sheeternetes/issues/26)
+- 📋 Tracking issue &amp; design: [sncfoundation/sheeternetes#26](https://github.com/sncfoundation/sheeternetes/issues/26) (open)
 - 🗺️ [SNCF Landscape](https://sncfoundation.github.io/landscape.html)
 - 🧩 [All projects](https://sncfoundation.github.io/projects.html)
 - ⚖️ [Governance &amp; how to contribute](https://github.com/sncfoundation/governance)
